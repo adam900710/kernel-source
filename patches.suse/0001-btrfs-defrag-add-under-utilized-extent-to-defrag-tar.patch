@@ -1,0 +1,128 @@
+From 91f74ea92aad1cc6c7400768ae4fa71a133873e8 Mon Sep 17 00:00:00 2001
+References: bsc#1221234
+Patch-mainline: Submitted, 12 Mar 2024 13:54:09 +1030 / linux-btrfs@vger.kernel.org
+From: Qu Wenruo <wqu@suse.com>
+Date: Fri, 5 Jan 2024 18:03:40 +1030
+Subject: [PATCH 1/2] btrfs: defrag: add under utilized extent to defrag target
+ list
+
+[BUG]
+The following script can lead to a very under utilized extent and we
+have no way to use defrag to properly reclaim its wasted space:
+
+  # mkfs.btrfs -f $dev
+  # mount $dev $mnt
+  # xfs_io -f -c "pwrite 0 128M" $mnt/foobar
+  # sync
+  # truncate -s 4k $mnt/foobar
+  # btrfs filesystem defrag $mnt/foobar
+  # sync
+
+After the above operations, the file "foobar" is still utilizing the
+whole 128M:
+
+        item 4 key (257 INODE_ITEM 0) itemoff 15883 itemsize 160
+                generation 7 transid 8 size 4096 nbytes 4096
+                block group 0 mode 100600 links 1 uid 0 gid 0 rdev 0
+                sequence 32770 flags 0x0(none)
+        item 5 key (257 INODE_REF 256) itemoff 15869 itemsize 14
+                index 2 namelen 4 name: file
+        item 6 key (257 EXTENT_DATA 0) itemoff 15816 itemsize 53
+                generation 7 type 1 (regular)
+                extent data disk byte 298844160 nr 134217728 <<<
+                extent data offset 0 nr 4096 ram 134217728
+                extent compression 0 (none)
+
+This is the common btrfs bookend behavior, that 128M extent would only
+be freed if the last referencer of the extent is freed.
+
+The problem is, normally we would go defrag to free that 128M extent,
+but defrag would not touch the extent at all.
+
+[CAUSE]
+The file extent has no adjacent extent at all, thus all existing defrag
+code consider it a perfectly good file extent, even if it's only
+utilizing a very tiny amount of space.
+
+[FIX]
+For a file extent without any adjacent file extent, we should still
+consider to defrag such under utilized extent, base on the following
+conditions:
+
+- utilization ratio
+  If the extent is utilizing less than 1/16 of the on-disk extent size,
+  then it would be a defrag target.
+
+- wasted space
+  If we defrag the extent and can free at least 16MiB, then it would be
+  a defrag target.
+
+Reported-by: Christoph Anton Mitterer <calestyo@scientia.org>
+Signed-off-by: Qu Wenruo <wqu@suse.com>
+---
+ fs/btrfs/defrag.c | 42 ++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 42 insertions(+)
+
+diff --git a/fs/btrfs/defrag.c b/fs/btrfs/defrag.c
+index f015fa1b6301..42f59d1456f9 100644
+--- a/fs/btrfs/defrag.c
++++ b/fs/btrfs/defrag.c
+@@ -950,6 +950,38 @@ struct defrag_target_range {
+ 	u64 len;
+ };
+ 
++/*
++ * Special entry for extents that do not have any adjacent extents.
++ *
++ * This is for cases like the only and truncated extent of a file.
++ * Normally they won't be defraged at all (as they won't be merged with
++ * any adjacent ones), but we may still want to defrag them, to free up
++ * some space if possible.
++ */
++static bool should_defrag_under_utilized(struct extent_map *em)
++{
++	/*
++	 * Ratio based check.
++	 *
++	 * If the current extent is only utilizing 1/16 of its on-disk size,
++	 * it's definitely under-utilized, and defragging it may free up
++	 * the whole extent.
++	 */
++	if (em->len < em->orig_block_len / 16)
++		return true;
++
++	/*
++	 * Wasted space based check.
++	 *
++	 * If we can free up at least 16MiB, then it may be a good idea
++	 * to defrag.
++	 */
++	if (em->len < em->orig_block_len &&
++	    em->orig_block_len - em->len > SZ_16M)
++		return true;
++	return false;
++}
++
+ /*
+  * Collect all valid target extents.
+  *
+@@ -1070,6 +1102,16 @@ static int defrag_collect_targets(struct btrfs_inode *inode,
+ 		if (!next_mergeable) {
+ 			struct defrag_target_range *last;
+ 
++			/*
++			 * This is a single extent without any chance to merge
++			 * with any adjacent extent.
++			 *
++			 * But if we may free up some space, it is still worth
++			 * defragging.
++			 */
++			if (should_defrag_under_utilized(em))
++				goto add;
++
+ 			/* Empty target list, no way to merge with last entry */
+ 			if (list_empty(target_list))
+ 				goto next;
+-- 
+2.44.0
+
